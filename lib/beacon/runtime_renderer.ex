@@ -29,6 +29,8 @@ defmodule Beacon.RuntimeRenderer do
       :ets.new(@table, [:set, :named_table, :public, read_concurrency: true])
     end
 
+    Beacon.CircuitBreaker.init()
+
     :ok
   end
 
@@ -111,6 +113,23 @@ defmodule Beacon.RuntimeRenderer do
       updated = MapSet.union(known, new_classes)
       :ets.insert(@table, {{site, :css_candidates}, updated})
     end
+
+    # 10. Register page dependencies for cascade invalidation
+    component_names = Beacon.PageRenderCache.extract_component_names(ir)
+
+    data_source_names =
+      manifest.extra
+      |> Map.get("data_sources", [])
+      |> Enum.map(fn spec -> spec["source"] || spec[:source] end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&safe_to_existing_atom/1)
+      |> MapSet.new()
+
+    Beacon.PageRenderCache.register_page_deps(site, page_id, %{
+      layout_id: manifest.layout_id,
+      components: component_names,
+      data_sources: data_source_names
+    })
 
     :ok
   end
@@ -270,7 +289,7 @@ defmodule Beacon.RuntimeRenderer do
         %{name: attr_name, opts: attr_opts}, acc ->
           case Keyword.get(attr_opts || [], :default) do
             nil -> acc
-            default -> Map.put(acc, String.to_atom(attr_name), default)
+            default -> Map.put(acc, String.to_existing_atom(attr_name), default)
           end
         _, acc -> acc
       end)
@@ -513,10 +532,16 @@ defmodule Beacon.RuntimeRenderer do
         {:ok, page_id}
 
       [] ->
-        # Check dynamic segments against already-cached routes
+        # Check dynamic segments against cached routes (populated at boot)
         case match_dynamic_route(site, path) do
-          {:ok, _} = found -> found
-          :error -> load_page_by_path(site, path)
+          {:ok, page_id} ->
+            # Route found but page IR may not be loaded yet (lazy loading).
+            # Ensure the page is loaded before returning.
+            ensure_page_loaded(site, page_id)
+            {:ok, page_id}
+
+          :error ->
+            load_page_by_path(site, path)
         end
     end
   end
@@ -556,15 +581,131 @@ defmodule Beacon.RuntimeRenderer do
       end
 
     Beacon.Cache.fetch(@table, {site, :page_load, path}, fn ->
-      case Beacon.Content.list_published_pages_for_paths(site, [path]) do
-        [page] ->
-          Beacon.RuntimeRenderer.Loader.load_page(site, page)
-          {:ok, page.id}
+      wait_for_load_slot(site)
 
-        _ ->
-          :error
+      try do
+        case Beacon.Content.list_published_pages_for_paths(site, [path]) do
+          [page] ->
+            Beacon.RuntimeRenderer.Loader.load_page(site, page)
+            {:ok, page.id}
+
+          _ ->
+            # No exact match — try matching against dynamic route patterns in the DB
+            match_dynamic_route_from_db(site, path)
+        end
+      after
+        release_load_slot(site)
       end
     end, ttl)
+  end
+
+  defp match_dynamic_route_from_db(site, path) do
+    request_segments = String.split(path, "/", trim: true)
+
+    # Query only paths (lightweight) to find a dynamic route pattern that matches
+    Beacon.Content.list_published_page_paths(site)
+    |> Enum.find_value(:error, fn {_page_id, route_path} ->
+      route_segments = String.split(route_path, "/", trim: true)
+
+      if length(route_segments) == length(request_segments) do
+        matches? =
+          Enum.zip(route_segments, request_segments)
+          |> Enum.all?(fn
+            {":" <> _, _} -> true
+            {"*" <> _, _} -> true
+            {a, b} -> a == b
+          end)
+
+        if matches? do
+          # Found a matching dynamic route — load the page by its pattern path
+          case Beacon.Content.list_published_pages_for_paths(site, [route_path]) do
+            [page] ->
+              Beacon.RuntimeRenderer.Loader.load_page(site, page)
+              {:ok, page.id}
+
+            _ ->
+              nil
+          end
+        end
+      end
+    end)
+  end
+
+  @doc """
+  Clears cached live_data definitions for all pages on a site.
+  Pages will lazy-load fresh definitions from the DB on next request.
+  """
+  def clear_live_data_cache(site) do
+    :ets.match_delete(@table, {{site, :"$1", :live_data}, :_})
+  end
+
+  @doc """
+  Registers a route (path → page_id) in ETS without loading the page IR.
+  Used at boot to populate the route index for dynamic route matching.
+  """
+  def register_route(site, page_id, path) do
+    :ets.insert(@table, {{site, :route, path}, page_id})
+  end
+
+  @max_concurrent_page_loads 4
+
+  @doc false
+  def ensure_page_loaded(site, page_id) do
+    # Check if the page IR is already in ETS
+    case :ets.lookup(@table, {site, page_id, :ir}) do
+      [{_, _}] ->
+        :ok
+
+      [] ->
+        # Page route is known but IR not loaded yet — load from DB
+        case fetch_manifest(site, page_id) do
+          {:ok, _} ->
+            :ok
+
+          :error ->
+            # No manifest either — need to load the full page from DB.
+            # Throttle concurrent loads to prevent thundering herd when
+            # a bot crawls many pages simultaneously on a cold cache.
+            throttled_page_load(site, page_id)
+        end
+    end
+  end
+
+  defp throttled_page_load(site, page_id) do
+    config = Beacon.Config.fetch!(site)
+    ttl = Beacon.Config.effective_ttl(config, :pages)
+
+    Beacon.Cache.fetch(@table, {site, :page_load, page_id}, fn ->
+      wait_for_load_slot(site)
+
+      try do
+        case Beacon.Content.get_published_page(site, page_id) do
+          nil -> :error
+          page -> Beacon.RuntimeRenderer.Loader.load_page(site, page); :ok
+        end
+      after
+        release_load_slot(site)
+      end
+    end, ttl)
+  end
+
+  defp wait_for_load_slot(site) do
+    key = {site, :page_load_count}
+
+    case :ets.update_counter(@table, key, {2, 1}, {key, 0}) do
+      count when count <= @max_concurrent_page_loads ->
+        :ok
+
+      _ ->
+        # Over limit — back off and retry
+        :ets.update_counter(@table, key, {2, -1})
+        Process.sleep(50 + :rand.uniform(100))
+        wait_for_load_slot(site)
+    end
+  end
+
+  defp release_load_slot(site) do
+    :ets.update_counter(@table, {site, :page_load_count}, {2, -1})
   end
 
   def lookup_page!(site, path) do
@@ -691,38 +832,58 @@ defmodule Beacon.RuntimeRenderer do
   No compiled modules are loaded or referenced.
   """
   def mount_assigns(site, path, opts \\ []) when is_atom(site) and is_binary(path) do
+    case Beacon.CircuitBreaker.check(site, path) do
+      {:tripped, _remaining} -> raise Beacon.Web.ServerError, "page is temporarily unavailable"
+      :ok -> :ok
+    end
+
+    try do
+      do_mount_assigns(site, path, opts)
+    rescue
+      error ->
+        unless client_error?(error) do
+          ttl = Beacon.Config.fetch!(site).circuit_breaker_ttl
+          if ttl > 0, do: Beacon.CircuitBreaker.trip(site, path, ttl)
+        end
+
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  defp do_mount_assigns(site, path, opts) do
     page_id = lookup_page!(site, path)
     manifest = fetch_manifest!(site, page_id)
     variant_roll = Keyword.get(opts, :variant_roll)
     path_info = String.split(String.trim_leading(path, "/"), "/", trim: true)
+    path_params = extract_path_params(manifest.path, path_info)
+
+    # Fetch DataStore sources BEFORE live_data so live_data code can reference them
+    {data_store_assigns, data_source_names} = fetch_data_store_assigns(site, manifest, path_params, %{})
 
     # Evaluate live data at mount time so assigns are available for the initial render
-    # (render is called before handle_params in LiveView)
     live_data = evaluate_live_data(site, page_id, path_info, %{})
 
-    if Map.has_key?(live_data, :employees) do
-      employees = live_data.employees
-      Logger.debug("[RuntimeRenderer] mount_assigns live_data has :employees — is_list=#{is_list(employees)}, count=#{if is_list(employees), do: length(employees), else: "N/A"}, nils=#{if is_list(employees), do: Enum.count(employees, &is_nil/1), else: "N/A"}")
-    else
-      Logger.debug("[RuntimeRenderer] mount_assigns live_data keys: #{inspect(Map.keys(live_data))}")
-    end
+    # Merge: DataStore results + live_data (live_data can override DataStore)
+    all_data = Map.merge(data_store_assigns, live_data)
 
     beacon = %{
       site: site,
-      path_params: %{},
+      path_params: path_params,
       query_params: %{},
       page: %{path: manifest.path, title: manifest.title},
       private: %{
         page_id: page_id,
         layout_id: manifest.layout_id,
-        live_data_keys: Map.keys(live_data),
+        live_data_keys: Map.keys(all_data),
+        data_source_names: data_source_names,
         live_path: path_info,
-        variant_roll: variant_roll
+        variant_roll: variant_roll,
+        page_type: Map.get(manifest.extra, "type", "default")
       }
     }
 
-    page_title = interpolate_title(manifest.title, manifest, live_data)
-    {:ok, Map.merge(live_data, %{beacon: beacon, page_title: page_title})}
+    page_title = interpolate_title(manifest.title, manifest, all_data)
+    {:ok, Map.merge(all_data, %{beacon: beacon, page_title: page_title})}
   end
 
   # ---------------------------------------------------------------------------
@@ -739,32 +900,135 @@ defmodule Beacon.RuntimeRenderer do
   Evaluates live_data definitions from ETS and merges everything into assigns.
   """
   def handle_params_assigns(site, path, params \\ %{}) when is_atom(site) and is_binary(path) do
+    case Beacon.CircuitBreaker.check(site, path) do
+      {:tripped, _remaining} -> raise Beacon.Web.ServerError, "page is temporarily unavailable"
+      :ok -> :ok
+    end
+
+    try do
+      do_handle_params_assigns(site, path, params)
+    rescue
+      error ->
+        unless client_error?(error) do
+          ttl = Beacon.Config.fetch!(site).circuit_breaker_ttl
+          if ttl > 0, do: Beacon.CircuitBreaker.trip(site, path, ttl)
+        end
+
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  defp do_handle_params_assigns(site, path, params) do
     page_id = lookup_page!(site, path)
     manifest = fetch_manifest!(site, page_id)
     path_info = String.split(String.trim_leading(path, "/"), "/", trim: true)
     query_params = Map.drop(params, ["path"])
+    path_params = extract_path_params(manifest.path, path_info)
+
+    # Fetch DataStore sources BEFORE live_data
+    {data_store_assigns, data_source_names} = fetch_data_store_assigns(site, manifest, path_params, query_params)
 
     # Evaluate live_data from stored definitions
     live_data = evaluate_live_data(site, page_id, path_info, query_params)
 
+    all_data = Map.merge(data_store_assigns, live_data)
+
     beacon = %{
       site: site,
-      path_params: extract_path_params(manifest.path, path_info),
+      path_params: path_params,
       query_params: query_params,
-      live_data: live_data,
+      live_data: all_data,
       page: %{path: manifest.path, title: manifest.title},
       private: %{
         page_id: page_id,
         layout_id: manifest.layout_id,
-        live_data_keys: Map.keys(live_data),
+        live_data_keys: Map.keys(all_data),
+        data_source_names: data_source_names,
         live_path: path_info,
-        variant_roll: nil
+        variant_roll: nil,
+        page_type: Map.get(manifest.extra, "type", "default")
       }
     }
 
-    page_title = interpolate_title(manifest.title, manifest, live_data)
-    {:ok, Map.merge(live_data, %{beacon: beacon, page_title: page_title})}
+    page_title = interpolate_title(manifest.title, manifest, all_data)
+    {:ok, Map.merge(all_data, %{beacon: beacon, page_title: page_title})}
   end
+
+  # ---------------------------------------------------------------------------
+  # DataStore integration
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Returns the list of data source names used by a page, read from the manifest's extra field.
+  """
+  def page_data_source_names(site, page_id) do
+    case fetch_manifest(site, page_id) do
+      {:ok, manifest} ->
+        manifest.extra
+        |> Map.get("data_sources", [])
+        |> Enum.map(fn spec -> spec["source"] || spec[:source] end)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.map(&safe_to_existing_atom/1)
+
+      :error ->
+        []
+    end
+  end
+
+  defp fetch_data_store_assigns(site, manifest, path_params, query_params) do
+    specs = Map.get(manifest.extra, "data_sources", [])
+
+    if specs == [] do
+      {%{}, []}
+    else
+      {assigns, source_names} =
+        Enum.reduce(specs, {%{}, []}, fn spec, {acc, names} ->
+          source_name =
+            (spec["source"] || spec[:source])
+            |> to_string()
+            |> safe_to_existing_atom()
+
+          case Beacon.DataStore.get_source(site, source_name) do
+            nil ->
+              Logger.warning("[Beacon.DataStore] data source #{inspect(source_name)} is referenced in page manifest but not registered for site #{inspect(site)}")
+              {acc, names}
+
+            _source ->
+              raw_params = spec["params"] || spec[:params] || %{}
+              resolved = resolve_data_store_params(raw_params, path_params, query_params)
+              value = Beacon.DataStore.fetch(site, source_name, resolved)
+              spread? = spec["spread"] == true || spec[:spread] == true
+
+              updated_acc =
+                if spread? and is_map(value) do
+                  atomized = Map.new(value, fn {k, v} -> {safe_to_existing_atom(to_string(k)), v} end)
+                  Map.merge(acc, atomized)
+                else
+                  Map.put(acc, source_name, value)
+                end
+
+              {updated_acc, [source_name | names]}
+          end
+        end)
+
+      {assigns, Enum.reverse(source_names)}
+    end
+  end
+
+  def resolve_data_store_params(param_spec, path_params, query_params) when is_map(param_spec) do
+    Map.new(param_spec, fn
+      {key, %{"path_param" => name}} -> {safe_to_existing_atom(key), Map.get(path_params, name) || Map.get(path_params, safe_to_existing_atom(name))}
+      {key, %{"query_param" => name}} -> {safe_to_existing_atom(key), Map.get(query_params, name)}
+      {key, %{"concat_path_params" => names}} when is_list(names) ->
+        value = Enum.map_join(names, "/", fn n -> Map.get(path_params, n) || Map.get(path_params, safe_to_existing_atom(n)) || "" end)
+        {safe_to_existing_atom(key), value}
+      {key, {:path_param, name}} -> {safe_to_existing_atom(key), Map.get(path_params, name) || Map.get(path_params, safe_to_existing_atom(name))}
+      {key, {:query_param, name}} -> {safe_to_existing_atom(key), Map.get(query_params, name)}
+      {key, value} -> {safe_to_existing_atom(key), value}
+    end)
+  end
+
+  def resolve_data_store_params(_, _, _), do: %{}
 
   # Interpolate snippets in page title (e.g., "{{ page.path }}", "{{ live_data.test }}")
   defp interpolate_title(title, manifest, live_data) do
@@ -792,7 +1056,11 @@ defmodule Beacon.RuntimeRenderer do
   def evaluate_live_data(site, page_id, path_info, query_params) do
     defs =
       case :ets.lookup(@table, {site, page_id, :live_data}) do
-        [{_, defs}] when is_list(defs) and defs != [] ->
+        [{_, :no_live_data}] ->
+          # Loaded previously but page has no live data definitions
+          []
+
+        [{_, defs}] when is_list(defs) ->
           defs
 
         _ ->
@@ -827,15 +1095,17 @@ defmodule Beacon.RuntimeRenderer do
     # Look up the page manifest to get the path pattern
     case fetch_manifest(site, page_id) do
       {:ok, manifest} ->
-        all_live_data = Beacon.Content.live_data_for_site(site, per_page: :infinity)
+        # Query only the live data matching this page's path pattern,
+        # not the entire site's live data. For static paths this is a
+        # single-row query; for dynamic paths we fetch candidate patterns.
+        matching_live_data = fetch_matching_live_data(site, manifest.path)
 
         defs =
-          all_live_data
-          |> Enum.filter(fn ld -> path_matches_pattern?(ld.path, manifest.path) end)
+          matching_live_data
           |> Enum.flat_map(fn ld ->
             Enum.map(ld.assigns, fn assign ->
               %{
-                key: String.to_atom(assign.key),
+                key: safe_to_existing_atom(assign.key),
                 value: assign.value,
                 format: assign.format,
                 path_pattern: ld.path
@@ -843,11 +1113,30 @@ defmodule Beacon.RuntimeRenderer do
             end)
           end)
 
-        :ets.insert(@table, {{site, page_id, :live_data}, defs})
+        if defs == [] do
+          :ets.insert(@table, {{site, page_id, :live_data}, :no_live_data})
+        else
+          :ets.insert(@table, {{site, page_id, :live_data}, defs})
+        end
+
         defs
 
       :error ->
         []
+    end
+  end
+
+  defp fetch_matching_live_data(site, page_path) do
+    # Try exact path match first (cheapest query)
+    case Beacon.Content.get_live_data_by(site, path: page_path) do
+      %{} = ld -> [ld]
+      nil ->
+        # No exact match — the page may use a different path pattern than
+        # the live data (e.g., page path "/blog/:slug" vs live data path "/blog/:slug").
+        # Query all live data paths and filter by pattern matching.
+        # This is bounded by the number of live data definitions per site (typically < 30).
+        Beacon.Content.live_data_for_site(site, per_page: :infinity)
+        |> Enum.filter(fn ld -> path_matches_pattern?(ld.path, page_path) end)
     end
   end
 
@@ -879,8 +1168,8 @@ defmodule Beacon.RuntimeRenderer do
 
     Enum.zip(pattern_segments, path_info)
     |> Enum.reduce(%{}, fn
-      {":" <> param, value}, acc -> Map.put(acc, String.to_atom(param), value)
-      {"*" <> param, value}, acc -> Map.put(acc, String.to_atom(param), value)
+      {":" <> param, value}, acc -> Map.put(acc, safe_to_existing_atom(param), value)
+      {"*" <> param, value}, acc -> Map.put(acc, safe_to_existing_atom(param), value)
       _, acc -> acc
     end)
   end
@@ -2503,7 +2792,7 @@ defmodule Beacon.RuntimeRenderer do
   end
   defp eval_kernel_macro(:sigil_w, [string, modifiers]) do
     case modifiers do
-      ~c"a" -> String.split(string) |> Enum.map(&String.to_atom/1)
+      ~c"a" -> String.split(string) |> Enum.map(&String.to_existing_atom/1)
       _ -> String.split(string)
     end
   end
@@ -2543,15 +2832,6 @@ defmodule Beacon.RuntimeRenderer do
     if is_nil(enum) or enum == "" do
       []
     else
-      if is_list(enum) do
-        nils = Enum.count(enum, &is_nil/1)
-        if nils > 0 do
-          Logger.error("[RuntimeRenderer] for #{inspect(var_name)}: enum has #{length(enum)} items, #{nils} nils. enum_ir=#{inspect(enum_ir, limit: 3)}")
-        end
-      else
-        Logger.error("[RuntimeRenderer] for #{inspect(var_name)}: enum is #{inspect(enum, limit: 3, printable_limit: 100)}, not a list. enum_ir=#{inspect(enum_ir, limit: 3)}")
-      end
-
       Enum.map(enum, fn item ->
         inner_bindings = destructure_binding(b, var_name, item)
         result = eval_ir(body_ir, a, inner_bindings)
@@ -2594,6 +2874,21 @@ defmodule Beacon.RuntimeRenderer do
   defp safe_to_string(value) when is_integer(value), do: Integer.to_string(value)
   defp safe_to_string(value) when is_float(value), do: Float.to_string(value)
   defp safe_to_string(value), do: String.Chars.to_string(value)
+
+  # Converts a string to an existing atom, falling back to String.to_atom/1
+  # only when the atom does not yet exist. This is safe for admin-defined keys
+  # (live data keys, path params) that are bounded per-site and not derived
+  # from end-user input.
+  # Returns true for errors with a 4xx plug_status (client errors like 404).
+  # These should not trip the circuit breaker since they're expected behavior.
+  defp client_error?(%{plug_status: status}) when is_integer(status) and status >= 400 and status < 500, do: true
+  defp client_error?(_), do: false
+
+  defp safe_to_existing_atom(string) when is_binary(string) do
+    String.to_existing_atom(string)
+  rescue
+    ArgumentError -> String.to_atom(string)
+  end
 
   # ===========================================================================
   # Event handler AST interpreter

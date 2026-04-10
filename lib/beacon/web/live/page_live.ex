@@ -49,10 +49,24 @@ defmodule Beacon.Web.PageLive do
     path_str = "/" <> Enum.join(path, "/")
     {:ok, assigns} = Beacon.RuntimeRenderer.mount_assigns(site, path_str, variant_roll: variant_roll)
 
+    # Subscribe to DataStore invalidation topics for this page's data sources
+    if config.mode == :live and connected?(socket) do
+      for source_name <- Map.get(assigns.beacon.private, :data_source_names, []) do
+        Beacon.DataStore.subscribe(site, source_name)
+      end
+    end
+
+    # Subscribe to page render cache updates
+    if config.mode == :live and connected?(socket) do
+      path_str = "/" <> Enum.join(path, "/")
+      Beacon.PubSub.subscribe_to_page_render(site, path_str)
+    end
+
     socket =
       socket
       |> Component.assign(assigns)
       |> Component.assign(:beacon_warming, warming)
+      |> Component.assign(:beacon_update_available, false)
 
     {:ok, socket, layout: {Beacon.Web.Layouts, :dynamic}}
   end
@@ -71,7 +85,49 @@ defmodule Beacon.Web.PageLive do
   def render(assigns) do
     %{beacon: %{site: site, private: %{page_id: page_id}}} = assigns
     {:ok, rendered} = Beacon.RuntimeRenderer.render_page(site, page_id, assigns)
-    rendered
+
+    update_available = Map.get(assigns, :beacon_update_available, false)
+
+    if update_available do
+      config = Beacon.Config.fetch!(site)
+      notification_mod = config.update_notification_component || Beacon.Web.Components.UpdateNotification
+
+      assigns =
+        assigns
+        |> Map.put(:beacon_page_content, rendered)
+        |> Map.put(:beacon_notification_mod, notification_mod)
+
+      ~H"""
+      <%= @beacon_page_content %>
+      <@beacon_notification_mod.render />
+      """
+    else
+      rendered
+    end
+  end
+
+  def handle_info({:page_render_updated, %{site: msg_site, page_id: _page_id}}, socket) do
+    %{beacon: %{site: site}} = socket.assigns
+
+    if msg_site != site do
+      {:noreply, socket}
+    else
+      config = Beacon.Config.fetch!(site)
+      page_type = get_in(socket.assigns, [:beacon, :private, :page_type]) || "default"
+
+      mode = Map.get(config.live_update_overrides, page_type, config.live_update)
+
+      case mode do
+        :manual ->
+          {:noreply, socket}
+
+        :notify ->
+          {:noreply, Component.assign(socket, :beacon_update_available, true)}
+
+        :automatic ->
+          do_live_update(socket)
+      end
+    end
   end
 
   def handle_info({:css_compiled, site}, socket) do
@@ -86,6 +142,40 @@ defmodule Beacon.Web.PageLive do
     else
       {:noreply, socket}
     end
+  end
+
+  def handle_info({:beacon_data_store_invalidated, source_name}, socket) do
+    %{beacon: %{site: site, private: %{page_id: page_id}}} = socket.assigns
+
+    # Re-fetch the invalidated data source with current params
+    case Beacon.RuntimeRenderer.fetch_manifest(site, page_id) do
+      {:ok, manifest} ->
+        path_params = socket.assigns.beacon.path_params
+        query_params = socket.assigns.beacon.query_params
+        specs = Map.get(manifest.extra, "data_sources", [])
+
+        spec = Enum.find(specs, fn s ->
+          name = s["source"] || s[:source]
+          to_string(name) == to_string(source_name)
+        end)
+
+        if spec do
+          raw_params = spec["params"] || spec[:params] || %{}
+          resolved = Beacon.RuntimeRenderer.resolve_data_store_params(raw_params, path_params, query_params)
+          value = Beacon.DataStore.fetch(site, source_name, resolved)
+          {:noreply, Component.assign(socket, source_name, value)}
+        else
+          {:noreply, socket}
+        end
+
+      :error ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_info({:beacon_data_store_invalidated, source_name, _params}, socket) do
+    # Re-fetch with current params regardless of which specific params were invalidated
+    handle_info({:beacon_data_store_invalidated, source_name}, socket)
   end
 
   def handle_info({:page_loaded, _}, socket) do
@@ -118,6 +208,15 @@ defmodule Beacon.Web.PageLive do
         raise Beacon.Web.ServerError,
               "handle_info expected {:noreply, socket}, got #{inspect(other)}"
     end
+  end
+
+  def handle_event("beacon:apply-update", _params, socket) do
+    {:noreply, updated_socket} = do_live_update(socket)
+    {:noreply, Component.assign(updated_socket, :beacon_update_available, false)}
+  end
+
+  def handle_event("beacon:dismiss-update", _params, socket) do
+    {:noreply, Component.assign(socket, :beacon_update_available, false)}
   end
 
   def handle_event(event_name, event_params, socket) do
@@ -156,13 +255,52 @@ defmodule Beacon.Web.PageLive do
 
         {:ok, params_assigns} = Beacon.RuntimeRenderer.handle_params_assigns(site, path_str, params)
 
+        # Update DataStore subscriptions if navigating to a different page
+        old_sources = Map.get(socket.assigns.beacon.private, :data_source_names, [])
+        new_sources = Map.get(params_assigns.beacon.private, :data_source_names, [])
+
+        if connected?(socket) do
+          for source <- old_sources -- new_sources, do: Beacon.DataStore.unsubscribe(site, source)
+          for source <- new_sources -- old_sources, do: Beacon.DataStore.subscribe(site, source)
+        end
+
+        # Update page render cache subscriptions when navigating between pages
+        if connected?(socket) do
+          old_path = "/" <> Enum.join(socket.assigns.beacon.private.live_path, "/")
+          new_path = "/" <> Enum.join(path_info, "/")
+
+          if old_path != new_path do
+            Beacon.PubSub.unsubscribe_from_page_render(site, old_path)
+            Beacon.PubSub.subscribe_to_page_render(site, new_path)
+          end
+        end
+
         socket =
           socket
           |> Component.assign(params_assigns)
           |> Component.assign(:page_title, params_assigns.beacon.page.title)
+          |> Component.assign(:beacon_update_available, false)
 
         {:noreply, socket}
     end
+  end
+
+  defp do_live_update(socket) do
+    %{beacon: %{site: site, private: %{live_path: path_info}}} = socket.assigns
+    path_str = "/" <> Enum.join(path_info, "/")
+
+    # Get current query params from socket
+    query_params = socket.assigns.beacon.query_params || %{}
+    params = Map.put(query_params, "path", path_info)
+
+    {:ok, assigns} = Beacon.RuntimeRenderer.handle_params_assigns(site, path_str, params)
+
+    socket =
+      socket
+      |> Component.assign(assigns)
+      |> Component.assign(:beacon_update_available, false)
+
+    {:noreply, socket}
   end
 
   @doc false

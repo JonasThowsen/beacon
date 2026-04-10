@@ -1025,8 +1025,8 @@ defmodule Beacon.Content do
   @doc """
   Returns template strings for all published pages on a site.
 
-  A lightweight projection that selects only the denormalized `template` text
-  column from page snapshots, avoiding deserialization of the full page binary.
+  Uses the denormalized `template` text column when available (v006 migration),
+  falling back to full page binary deserialization for unmigrated databases.
   Used by CSS candidate extraction.
   """
   @doc type: :pages
@@ -1560,7 +1560,7 @@ defmodule Beacon.Content do
           icon =
             assigns.name
             |> String.replace("-", "_")
-            |> String.to_atom()
+            |> String.to_existing_atom()
 
           component = Function.capture(Beacon.Heroicons, icon, 1)
 
@@ -3176,11 +3176,24 @@ defmodule Beacon.Content do
   @doc type: :components
   @spec update_component(Component.t(), map()) :: {:ok, Component.t()} | {:error, Changeset.t()}
   def update_component(%Component{} = component, attrs) do
-    component
-    |> Component.changeset(attrs)
-    |> validate_component_template()
-    |> repo(component).update()
-    |> tap(&maybe_broadcast_updated_content_event(&1, :component))
+    result =
+      component
+      |> Component.changeset(attrs)
+      |> validate_component_template()
+      |> repo(component).update()
+      |> tap(&maybe_broadcast_updated_content_event(&1, :component))
+
+    case result do
+      {:ok, updated_component} ->
+        # Cascade invalidation to all pages using this component
+        component_name = String.to_atom(updated_component.name)
+        Beacon.PageRenderCache.invalidate_by_component(updated_component.site, component_name)
+
+      _ ->
+        :ok
+    end
+
+    result
   end
 
   defp validate_component_template(changeset) do
@@ -4609,6 +4622,9 @@ defmodule Beacon.Content do
       resource_links: layout.resource_links || []
     )
 
+    # Cascade invalidation to all pages using this layout
+    Beacon.PageRenderCache.invalidate_by_layout(site, to_string(id))
+
     :ok
   end
 
@@ -4621,6 +4637,8 @@ defmodule Beacon.Content do
       page ->
         :ok = Beacon.RouterServer.add_page(page.site, page.id, page.path)
         Beacon.RuntimeRenderer.Loader.load_page(site, page)
+        # Cascade invalidation to notify connected LiveViews
+        Beacon.PageRenderCache.invalidate_page(site, to_string(page.id))
     end
 
     :ok
