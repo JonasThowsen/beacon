@@ -109,11 +109,13 @@ about Beacon internals:
 
 The file `dev.exs` is a self-contained Phoenix application running Beacon with sample data and code reloading enabled. Follow these steps to get a site up and running:
 
-1. Install dependencies, build assets, and run database setup:
+1. Install dependencies, create and migrate the database, and build assets:
 
 ```sh
 mix setup
 ```
+
+`mix setup` provisions the test database, and `mix test` also provisions it before running the suite.
 
 2. Execute the dev script:
 

@@ -72,7 +72,6 @@ defmodule Beacon.MixProject do
       {:gettext, "~> 1.0"},
       {:hackney, "~> 1.16"},
       {:image, "~> 0.40"},
-      {:vix, "<= 0.30.0 or >= 0.31.1"},
       {:jason, "~> 1.0"},
       # TODO: remove in v0.6 or when we enable components upgrade
       {:oembed, "~> 0.4"},
@@ -117,8 +116,11 @@ defmodule Beacon.MixProject do
 
   defp aliases do
     [
-      setup: ["deps.get", "assets.setup", "assets.build"],
+      setup: ["deps.get", "cmd MIX_ENV=test mix ecto.setup", "assets.setup", "assets.build"],
+      "ecto.setup": ["ecto.create", "ecto.migrate"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
       dev: ["run --no-halt dev.exs"],
+      test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
       "test.ci": ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
       "assets.setup": [
         "esbuild.install --if-missing",

@@ -26,7 +26,7 @@ end
 Application.put_env(:beacon, :ecto_repos, [Demo.Repo])
 
 Application.put_env(:beacon, Demo.Repo,
-  url: System.get_env("DATABASE_URL") || "postgres://localhost:5432/beacon_dev",
+  url: System.get_env("DATABASE_URL") || "postgres://postgres:postgres@localhost:5432/beacon_dev",
   pool_size: System.schedulers_online() * 2,
   priv: "test/support",
   stacktrace: true,
