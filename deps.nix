@@ -581,6 +581,23 @@ let
         in
         drv;
 
+      glob_ex =
+        let
+          version = "0.1.11";
+          drv = buildMix {
+            inherit version;
+            name = "glob_ex";
+            appConfigPath = ./config;
+
+            src = fetchHex {
+              inherit version;
+              pkg = "glob_ex";
+              sha256 = "342729363056e3145e61766b416769984c329e4378f1d558b63e341020525de4";
+            };
+          };
+        in
+        drv;
+
       hackney =
         let
           version = "1.23.0";
@@ -660,6 +677,33 @@ let
 
             beamDeps = [
               unicode_util_compat
+            ];
+          };
+        in
+        drv;
+
+      igniter =
+        let
+          version = "0.7.7";
+          drv = buildMix {
+            inherit version;
+            name = "igniter";
+            appConfigPath = ./config;
+
+            src = fetchHex {
+              inherit version;
+              pkg = "igniter";
+              sha256 = "caeb1227887362b22038ff8419a7e6ddd3888f3d7e6cffacb14c73abbce17600";
+            };
+
+            beamDeps = [
+              glob_ex
+              jason
+              owl
+              req
+              rewrite
+              sourceror
+              spitfire
             ];
           };
         in
@@ -878,6 +922,23 @@ let
               httpoison
               poison
             ];
+          };
+        in
+        drv;
+
+      owl =
+        let
+          version = "0.13.0";
+          drv = buildMix {
+            inherit version;
+            name = "owl";
+            appConfigPath = ./config;
+
+            src = fetchHex {
+              inherit version;
+              pkg = "owl";
+              sha256 = "59bf9d11ce37a4db98f57cb68fbfd61593bf419ec4ed302852b6683d3d2f7475";
+            };
           };
         in
         drv;
@@ -1187,6 +1248,29 @@ let
         in
         drv;
 
+      rewrite =
+        let
+          version = "1.3.0";
+          drv = buildMix {
+            inherit version;
+            name = "rewrite";
+            appConfigPath = ./config;
+
+            src = fetchHex {
+              inherit version;
+              pkg = "rewrite";
+              sha256 = "d111ac7ff3a58a802ef4f193bbd1831e00a9c57b33276e5068e8390a212714a5";
+            };
+
+            beamDeps = [
+              glob_ex
+              sourceror
+              text_diff
+            ];
+          };
+        in
+        drv;
+
       rustler =
         let
           version = "0.36.1";
@@ -1274,6 +1358,40 @@ let
         in
         drv;
 
+      sourceror =
+        let
+          version = "1.12.0";
+          drv = buildMix {
+            inherit version;
+            name = "sourceror";
+            appConfigPath = ./config;
+
+            src = fetchHex {
+              inherit version;
+              pkg = "sourceror";
+              sha256 = "755703683bd014ebcd5de9acc24b68fb874a660a568d1d63f8f98cd8a6ef9cd0";
+            };
+          };
+        in
+        drv;
+
+      spitfire =
+        let
+          version = "0.3.10";
+          drv = buildMix {
+            inherit version;
+            name = "spitfire";
+            appConfigPath = ./config;
+
+            src = fetchHex {
+              inherit version;
+              pkg = "spitfire";
+              sha256 = "6a6a5f77eb4165249c76199cd2d01fb595bac9207aed3de551918ac1c2bc9267";
+            };
+          };
+        in
+        drv;
+
       ssl_verify_fun =
         let
           version = "1.1.7";
@@ -1341,6 +1459,23 @@ let
               inherit version;
               pkg = "telemetry";
               sha256 = "2172e05a27531d3d31dd9782841065c50dd5c3c7699d95266b2edd54c2dafa1c";
+            };
+          };
+        in
+        drv;
+
+      text_diff =
+        let
+          version = "0.1.0";
+          drv = buildMix {
+            inherit version;
+            name = "text_diff";
+            appConfigPath = ./config;
+
+            src = fetchHex {
+              inherit version;
+              pkg = "text_diff";
+              sha256 = "d1ffaaecab338e49357b6daa82e435f877e0649041ace7755583a0ea3362dbd7";
             };
           };
         in

@@ -85,6 +85,7 @@ defmodule Beacon.MixProject do
       {:safe_code, "~> 0.2"},
       {:solid, "~> 0.14"},
       {:tailwind_compiler, github: "BeaconCMS/tailwind_compiler"},
+      {:igniter, ">= 0.5.24", optional: true},
       esbuild_version(),
       # Dev, Test, Docs
       {:bandit, "~> 1.0", only: :dev, optional: true},
