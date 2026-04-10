@@ -1,5 +1,7 @@
 import Config
 
+config :esbuild, path: System.get_env("MIX_ESBUILD_PATH"), version_check: false
+config :tailwind, path: System.get_env("MIX_TAILWIND_PATH"), version_check: false
 config :beacon, :generators, binary_id: true
 
 config :phoenix, :json_library, Jason

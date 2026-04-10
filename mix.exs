@@ -56,6 +56,7 @@ defmodule Beacon.MixProject do
 
   defp deps do
     [
+      {:deps_nix, "~> 2.5"},
       # Overridable
       override_dep(:phoenix, "~> 1.7", "PHOENIX_VERSION", "PHOENIX_PATH"),
       override_dep(:phoenix_live_view, ">= 1.0.1", "PHOENIX_LIVE_VIEW_VERSION", "PHOENIX_LIVE_VIEW_PATH"),
@@ -126,7 +127,8 @@ defmodule Beacon.MixProject do
         "esbuild.install --if-missing",
         "cmd npm install --prefix assets"
       ],
-      "assets.build": ["esbuild cdn", "esbuild cdn_min", "esbuild tailwind_bundle"]
+      "assets.build": ["esbuild cdn", "esbuild cdn_min", "esbuild tailwind_bundle"],
+      "deps.get": ["deps.get", "deps.nix"]
     ]
   end
 
