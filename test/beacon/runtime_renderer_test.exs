@@ -18,6 +18,13 @@ defmodule Beacon.RuntimeRendererTest do
     :ok
   end
 
+  defp strip_metadata(ast) do
+    Macro.prewalk(ast, fn
+      {name, meta, args} when is_list(meta) -> {name, [], args}
+      other -> other
+    end)
+  end
+
   describe "publish and render template" do
     test "renders a simple static template" do
       RuntimeRenderer.publish_page(@site, "page_1", %{
@@ -208,6 +215,69 @@ defmodule Beacon.RuntimeRendererTest do
 
       {:noreply, socket} = RuntimeRenderer.handle_event(@site, "event_4", "dec", %{}, socket)
       assert socket.assigns.count == 1
+    end
+  end
+
+  describe "extract_ir compatibility" do
+    test "supports LiveView 1.1 comprehension AST" do
+      ast =
+        quote do
+          dynamic = fn track_changes? ->
+            changed =
+              case assigns do
+                %{__changed__: changed} when track_changes? -> changed
+                _ -> nil
+              end
+
+            vars_changed = if track_changes?, do: nil
+
+            v1 =
+              case Phoenix.LiveView.Engine.changed_assign?(changed, :items) do
+                true ->
+                  for_entries = Phoenix.LiveView.LiveStream.mark_consumable(assigns.items)
+
+                  Phoenix.LiveView.LiveStream.annotate_comprehension(
+                    %Phoenix.LiveView.Comprehension{
+                      has_key?: false,
+                      static: ["<li>", "</li>"],
+                      entries:
+                        for item <- for_entries do
+                          {nil, %{item: item},
+                           fn _local_vars_changed, _track_changes? ->
+                             v0 =
+                               case Phoenix.LiveView.Engine.changed_assign?(%{item: true}, :item) do
+                                 true -> Phoenix.LiveView.Engine.live_to_iodata(item)
+                                 false -> nil
+                               end
+
+                             [v0]
+                           end}
+                        end,
+                      fingerprint: 123
+                    },
+                    for_entries
+                  )
+
+                false ->
+                  nil
+              end
+
+            [v1]
+          end
+
+          %Phoenix.LiveView.Rendered{
+            static: ["<ul>", "</ul>"],
+            dynamic: dynamic,
+            fingerprint: 456,
+            root: true
+          }
+        end
+        |> strip_metadata()
+
+      ir = RuntimeRenderer.extract_ir(ast)
+      html = ir |> RuntimeRenderer.render_ir(%{items: ["a", "b"]}) |> Phoenix.HTML.Safe.to_iodata() |> IO.iodata_to_binary()
+
+      assert html == "<ul><li>a</li><li>b</li></ul>"
     end
   end
 

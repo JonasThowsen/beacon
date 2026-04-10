@@ -1173,20 +1173,8 @@ defmodule Beacon.RuntimeRenderer do
   #       v1 = case ...
   #     [v0, v1, ...]               (return list)
   #   end
-  defp extract_dynamics({:fn, [], [{:->, [], [[_track_changes], body]}]}) do
-    {:__block__, [], [_changed_setup | rest]} = body
-
-    {all_assigns, return_vars} =
-      case rest do
-        # No dynamic expressions (static template): empty block + empty list
-        [{:__block__, [], []}, []] -> {[], []}
-        # Multiple dynamic expressions: __block__ wrapping assignments + return list
-        [{:__block__, [], assigns}, return_list] when is_list(assigns) -> {assigns, return_list}
-        # Single dynamic expression: one assignment + return list
-        [{:=, _, _} = single_assign, return_list] -> {[single_assign], return_list}
-        # Fallback
-        _ -> {[], []}
-      end
+  defp extract_dynamics({:fn, _, [{:->, _, [[_track_changes], body]}]}) do
+    {all_assigns, return_vars} = extract_dynamic_assigns_and_return(body)
 
     # Identify which variable names appear in the return list (these are the output dynamics)
     output_var_names = MapSet.new(Enum.map(return_vars, fn {name, _, _} -> name end))
@@ -1213,6 +1201,30 @@ defmodule Beacon.RuntimeRenderer do
 
     binding_irs ++ output_irs
   end
+
+  defp extract_dynamic_assigns_and_return({:__block__, _, parts}) when is_list(parts) do
+    case List.last(parts) do
+      {:__block__, _, _} = inner_block ->
+        extract_dynamic_assigns_and_return(inner_block)
+
+      _ ->
+        case Enum.reverse(parts) do
+          [return_list, {:__block__, _, assigns} | _] when is_list(return_list) and is_list(assigns) ->
+            {assigns, return_list}
+
+          [return_list, {:=, _, _} = single_assign | _] when is_list(return_list) ->
+            {[single_assign], return_list}
+
+          [return_list | _] when is_list(return_list) ->
+            {[], return_list}
+
+          _ ->
+            {[], []}
+        end
+    end
+  end
+
+  defp extract_dynamic_assigns_and_return(_), do: {[], []}
 
   defp extract_one_dynamic({:=, _meta, [{_var, _, _}, case_expr]}) do
     extract_case_expr(case_expr)
@@ -1375,13 +1387,23 @@ defmodule Beacon.RuntimeRenderer do
   end
 
   # Phoenix.LiveView.Comprehension.__annotate__(struct, enum)
-  defp transform_expr({{:., [], [{:__aliases__, _, [:Phoenix, :LiveView, :Comprehension]}, :__annotate__]}, [], [comp_struct, _enum]}) do
-    transform_comprehension(comp_struct, nil)
+  defp transform_expr({{:., _, [mod, :__annotate__]}, _, [comp_struct, _enum]}) do
+    if liveview_comprehension_module?(mod), do: transform_comprehension(comp_struct, nil), else: {:literal, ""}
+  end
+
+  # Phoenix.LiveView.LiveStream.annotate_comprehension(struct, enum)
+  defp transform_expr({{:., _, [mod, :annotate_comprehension]}, _, [comp_struct, _enum]}) do
+    if liveview_livestream_module?(mod), do: transform_comprehension(comp_struct, nil), else: {:literal, ""}
   end
 
   # Phoenix.LiveView.Comprehension.__mark_consumable__(enum)
-  defp transform_expr({{:., [], [{:__aliases__, _, [:Phoenix, :LiveView, :Comprehension]}, :__mark_consumable__]}, [], [enum_expr]}) do
-    transform_expr(enum_expr)
+  defp transform_expr({{:., _, [mod, :__mark_consumable__]}, _, [enum_expr]}) do
+    if liveview_comprehension_module?(mod), do: transform_expr(enum_expr), else: {:literal, ""}
+  end
+
+  # Phoenix.LiveView.LiveStream.mark_consumable(enum)
+  defp transform_expr({{:., _, [mod, :mark_consumable]}, _, [enum_expr]}) do
+    if liveview_livestream_module?(mod), do: transform_expr(enum_expr), else: {:literal, ""}
   end
 
   # List literal
@@ -1630,35 +1652,62 @@ defmodule Beacon.RuntimeRenderer do
   end
 
   defp find_comprehension(parts) do
-    # First, find the enum source from __mark_consumable__(assigns.xxx)
-    enum_source =
-      Enum.find_value(parts, nil, fn
-        {:=, [], [{:for, _, _}, {{:., [], [{:__aliases__, _, [:Phoenix, :LiveView, :Comprehension]}, :__mark_consumable__]}, [], [enum_expr]}]} ->
-          transform_expr(enum_expr)
-
-        _ ->
-          nil
-      end)
+    enum_source = Enum.find_value(parts, nil, &extract_comprehension_enum_source/1)
 
     Enum.find_value(parts, :not_found, fn
-      {{:., [], [{:__aliases__, _, [:Phoenix, :LiveView, :Comprehension]}, :__annotate__]}, [], [comp, _]} ->
-        {:ok, transform_comprehension(comp, enum_source)}
+      {{:., _, [mod, :__annotate__]}, _, [comp, _]} ->
+        if liveview_comprehension_module?(mod), do: {:ok, transform_comprehension(comp, enum_source)}
+
+      {{:., _, [mod, :annotate_comprehension]}, _, [comp, _]} ->
+        if liveview_livestream_module?(mod), do: {:ok, transform_comprehension(comp, enum_source)}
 
       _ ->
         nil
     end)
   end
 
+  defp liveview_comprehension_module?({:__aliases__, _, [:Phoenix, :LiveView, :Comprehension]}), do: true
+  defp liveview_comprehension_module?(Phoenix.LiveView.Comprehension), do: true
+  defp liveview_comprehension_module?(_), do: false
+
+  defp liveview_livestream_module?({:__aliases__, _, [:Phoenix, :LiveView, :LiveStream]}), do: true
+  defp liveview_livestream_module?(Phoenix.LiveView.LiveStream), do: true
+  defp liveview_livestream_module?(_), do: false
+
+  defp extract_comprehension_enum_source({:=, _, [_lhs, {{:., _, [mod, :__mark_consumable__]}, _, [enum_expr]}]}) do
+    if liveview_comprehension_module?(mod), do: transform_expr(enum_expr)
+  end
+
+  defp extract_comprehension_enum_source({:=, _, [_lhs, {{:., _, [mod, :mark_consumable]}, _, [enum_expr]}]}) do
+    if liveview_livestream_module?(mod), do: transform_expr(enum_expr)
+  end
+
+  defp extract_comprehension_enum_source(_), do: nil
+
   defp transform_comprehension({:%, [], [_aliases, {:%{}, [], fields}]}, enum_source) do
     static = Keyword.fetch!(fields, :static)
     fingerprint = Keyword.fetch!(fields, :fingerprint)
-    dynamics_expr = Keyword.fetch!(fields, :dynamics)
 
-    # The dynamics is a `for` comprehension. Extract var name and body,
-    # but replace the enum with the actual source (from __mark_consumable__).
-    dynamics_ir = transform_for_dynamics(dynamics_expr, enum_source)
+    dynamics_ir =
+      cond do
+        Keyword.has_key?(fields, :dynamics) ->
+          # Older LiveView versions store the body directly in :dynamics.
+          transform_for_dynamics(Keyword.fetch!(fields, :dynamics), enum_source)
+
+        Keyword.has_key?(fields, :entries) ->
+          # LiveView 1.1+ stores keyed entry tuples in :entries.
+          transform_for_dynamics(Keyword.fetch!(fields, :entries), enum_source)
+
+        true ->
+          {:literal, []}
+      end
 
     {:comprehension, %{static: static, fingerprint: fingerprint, dynamics: dynamics_ir}}
+  end
+
+  defp transform_for_dynamics({:for, _, [{:<-, _, [binding, _for_var]}, [do: {:{}, _, [_key, _vars, render_fun]}]]}, enum_source) do
+    var_name = extract_var_name(binding)
+    {:for_expr, var_name, enum_source || {:literal, []}, transform_comprehension_entry_render(render_fun)}
   end
 
   defp transform_for_dynamics({:for, _, [{:<-, _, [binding, _for_var]}, [do: body]]}, enum_source) do
@@ -1667,6 +1716,17 @@ defmodule Beacon.RuntimeRenderer do
   end
 
   defp transform_for_dynamics(other, _enum_source), do: transform_expr(other)
+
+  defp transform_comprehension_entry_render({:fn, _, [{:->, _, [[_vars_changed, _track_changes], body]}]}) do
+    {assigns, return_vars} = extract_dynamic_assigns_and_return(body)
+
+    case return_vars do
+      vars when is_list(vars) -> transform_for_body({:__block__, [], assigns ++ [vars]})
+      _ -> transform_expr(body)
+    end
+  end
+
+  defp transform_comprehension_entry_render(other), do: transform_expr(other)
 
   # The for body is typically: __block__ [v0 = live_to_iodata(item), [v0]]
   # We need to extract the actual expressions and return them as a list.
@@ -1831,6 +1891,30 @@ defmodule Beacon.RuntimeRenderer do
       end)
 
     Enum.reverse(results)
+  end
+
+  defp build_comprehension(static, fingerprint, dynamics) do
+    if Map.has_key?(Phoenix.LiveView.Comprehension.__struct__(), :entries) do
+      entries =
+        Enum.map(dynamics, fn rendered_dynamics ->
+          {nil, %{}, fn _vars_changed, _track_changes? -> rendered_dynamics end}
+        end)
+
+      struct(Phoenix.LiveView.Comprehension,
+        static: static,
+        has_key?: false,
+        entries: entries,
+        fingerprint: fingerprint,
+        stream: nil
+      )
+    else
+      struct(Phoenix.LiveView.Comprehension,
+        static: static,
+        dynamics: dynamics,
+        fingerprint: fingerprint,
+        stream: nil
+      )
+    end
   end
 
   # Evaluate an IR expression with assigns and local bindings (for comprehension vars)
@@ -2121,13 +2205,7 @@ defmodule Beacon.RuntimeRenderer do
   # Comprehension: produces %Phoenix.LiveView.Comprehension{}
   defp eval_ir({:comprehension, %{static: static, fingerprint: fp, dynamics: dyn_expr}}, a, b) do
     dynamics = eval_comprehension_dynamics(dyn_expr, a, b)
-
-    %Phoenix.LiveView.Comprehension{
-      static: static,
-      dynamics: dynamics,
-      fingerprint: fp,
-      stream: nil
-    }
+    build_comprehension(static, fp, dynamics)
   end
 
   defp eval_ir({:for_expr, var_name, enum_ir, body_ir}, a, b) do
